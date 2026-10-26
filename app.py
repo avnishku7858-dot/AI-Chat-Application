@@ -1,55 +1,23 @@
 """
 AI Chat Application
 ===================
-A feature-packed, production-ready AI chat interface built with Streamlit and Google Gemini.
-
-Features:
-- Multi-tier API key resolution: Streamlit Secrets (.streamlit/secrets.toml) > Environment Variables (.env) > Sidebar UI input
-- Real-time token streaming with Google GenAI SDK (`google-genai`)
-- System Instruction & Persona customization (Technical Mentor, ATS Resume Strategist, Socratic Tutor, Custom)
-- Multi-turn conversation management with a configurable sliding-window context buffer
-- Live token estimation and per-session cost tracker (USD)
-- Chat export (JSON & Markdown) and quick reset
-- Graceful simulation fallback when no API key is provided
+Production-ready ASGI application configured for Vercel Serverless deployment and local execution.
+Provides a modern chat interface and Gemini API backend.
 """
 
 import os
-import json
 import time
-import streamlit as st
+from typing import List, Optional
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 
-# Load local environment variables from .env if present
+# Load environment variables from .env if present
 load_dotenv()
 
-# Page configuration
-st.set_page_config(
-    page_title="Gemini AI Studio",
-    page_icon="✨",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# Preset System Instructions / Personas
-PERSONA_PRESETS = {
-    "Senior Software Engineer": (
-        "You are an experienced senior software engineer and mentor. Provide clean, idiomatic, "
-        "well-commented code, explain trade-offs, and suggest architecture best practices."
-    ),
-    "ATS Resume Strategist": (
-        "You are an expert executive recruiter and ATS resume specialist. Review achievements, "
-        "quantify impact using the STAR/XYZ framework, and optimize keywords."
-    ),
-    "Socratic Tutor": (
-        "You are a patient, insightful educator. Instead of giving answers immediately, guide the "
-        "learner through thought-provoking questions, analogies, and conceptual hints."
-    ),
-    "Concise Assistant": (
-        "You are a direct, helpful, and concise assistant. Answer all questions accurately and "
-        "succinctly in under 3 sentences unless explicitly asked to elaborate."
-    ),
-    "Custom": ""
-}
+# Top-level ASGI entrypoint expected by Vercel
+app = FastAPI(title="Gemini AI Chat Studio", version="1.0.0")
 
 # Pricing per million tokens (USD)
 PRICING_MAP = {
@@ -59,268 +27,477 @@ PRICING_MAP = {
 }
 
 
+class MessageItem(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: List[MessageItem]
+    system_instruction: Optional[str] = None
+    model: str = "gemini-3.8-flash"
+    temperature: float = 0.7
+    top_p: float = 0.95
+    max_output_tokens: int = 1024
+    api_key: Optional[str] = None
+
+
 def estimate_tokens(text: str) -> int:
-    """Heuristic approximation: ~4 characters per token."""
     return max(1, len(text) // 4) if text else 0
 
 
 def calculate_cost(model: str, prompt_toks: int, out_toks: int) -> float:
-    """Calculate query cost in USD based on model pricing."""
     rates = PRICING_MAP.get(model, {"in": 0.15, "out": 0.60})
     return (prompt_toks / 1_000_000 * rates["in"]) + (out_toks / 1_000_000 * rates["out"])
 
 
-def resolve_api_key() -> str:
-    """Retrieve API key from st.secrets, environment variables, or default empty string."""
-    key = ""
-    # 1. Try Streamlit Secrets
-    try:
-        if "GEMINI_API_KEY" in st.secrets:
-            key = st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        pass
-
-    # 2. Try OS Environment
-    if not key or key == "your_gemini_api_key_here":
-        key = os.getenv("GEMINI_API_KEY", "")
-
-    return key if key != "your_gemini_api_key_here" else ""
+def get_server_key() -> str:
+    key = os.getenv("GEMINI_API_KEY", "")
+    if key and key != "your_gemini_api_key_here":
+        return key
+    return ""
 
 
-# =====================================================================
-# Session State Initialization
-# =====================================================================
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "total_prompt_tokens" not in st.session_state:
-    st.session_state.total_prompt_tokens = 0
-
-if "total_completion_tokens" not in st.session_state:
-    st.session_state.total_completion_tokens = 0
-
-if "total_cost_usd" not in st.session_state:
-    st.session_state.total_cost_usd = 0.0
+@app.get("/api/config")
+async def get_config():
+    server_key = get_server_key()
+    return {
+        "has_server_key": bool(server_key),
+        "default_model": os.getenv("DEFAULT_MODEL", "gemini-3.8-flash"),
+    }
 
 
-# =====================================================================
-# Sidebar: Configuration & Controls
-# =====================================================================
-with st.sidebar:
-    st.title("✨ App Settings")
+@app.post("/api/chat")
+async def chat_endpoint(req: ChatRequest):
+    # Resolve API Key
+    effective_key = req.api_key.strip() if req.api_key else ""
+    if not effective_key or effective_key == "your_gemini_api_key_here":
+        effective_key = get_server_key()
 
-    # 1. Authentication
-    st.subheader("1. API Key")
-    detected_key = resolve_api_key()
+    # Calculate prompt tokens
+    full_prompt_text = (req.system_instruction or "") + " " + " ".join(m.content for m in req.messages)
+    p_toks = estimate_tokens(full_prompt_text)
 
-    user_api_key = st.text_input(
-        "Gemini API Key",
-        value=detected_key,
-        type="password",
-        placeholder="AIzaSy...",
-        help="Reads automatically from .streamlit/secrets.toml or .env, or paste your key here.",
-    )
+    # 1. Live LLM execution if key available
+    if effective_key:
+        try:
+            from google import genai
+            from google.genai import types
 
-    active_api_key = user_api_key.strip()
-    is_live_key = bool(active_api_key and active_api_key != "your_gemini_api_key_here")
+            client = genai.Client(api_key=effective_key)
 
-    if is_live_key:
-        st.success("API Key Active (Ready for Live LLM)", icon="🟢")
-    else:
-        st.info("No active key detected. Running in educational simulation mode.", icon="ℹ️")
+            config = types.GenerateContentConfig(
+                system_instruction=req.system_instruction if req.system_instruction and req.system_instruction.strip() else None,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                max_output_tokens=req.max_output_tokens,
+            )
 
-    st.divider()
-
-    # 2. System Instructions / Personas
-    st.subheader("2. Assistant Persona")
-    selected_preset = st.selectbox("Persona Template", list(PERSONA_PRESETS.keys()))
-
-    if selected_preset == "Custom":
-        system_instruction = st.text_area(
-            "Custom System Instruction",
-            value="You are an intelligent, empathetic, and knowledgeable AI assistant.",
-            height=90,
-        )
-    else:
-        system_instruction = st.text_area(
-            "Active System Instruction",
-            value=PERSONA_PRESETS[selected_preset],
-            height=90,
-        )
-
-    st.divider()
-
-    # 3. Model Parameters
-    st.subheader("3. Model & Hyperparameters")
-    model_choice = st.selectbox(
-        "Model Selection",
-        ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-4-argon"],
-        index=0,
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        temperature = st.slider("Temperature", 0.0, 1.5, 0.7, 0.05, help="Higher values produce more creative output.")
-    with col2:
-        top_p = st.slider("Top-P", 0.1, 1.0, 0.95, 0.05, help="Nucleus sampling threshold.")
-
-    max_tokens = st.slider("Max Output Tokens", 100, 2048, 1024, 64)
-    history_limit = st.slider("Sliding Window Memory (Turns)", 1, 15, 6, help="Number of conversation turns passed as context.")
-
-    st.divider()
-
-    # 4. Token & Cost Telemetry
-    st.subheader("4. Session Metrics")
-    m1, m2 = st.columns(2)
-    m1.metric("Prompt Tokens", st.session_state.total_prompt_tokens)
-    m2.metric("Output Tokens", st.session_state.total_completion_tokens)
-    st.metric("Estimated Cost", f"${st.session_state.total_cost_usd:.6f} USD")
-
-    st.divider()
-
-    # 5. Actions & Export
-    if st.button("🗑️ Clear Conversation", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.total_prompt_tokens = 0
-        st.session_state.total_completion_tokens = 0
-        st.session_state.total_cost_usd = 0.0
-        st.rerun()
-
-    if st.session_state.messages:
-        # JSON Export
-        export_json = json.dumps(st.session_state.messages, indent=2)
-        st.download_button(
-            "📥 Export History (JSON)",
-            data=export_json,
-            file_name="chat_history.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-
-        # Markdown Export
-        md_content = "# Chat Conversation Export\n\n"
-        for m in st.session_state.messages:
-            md_content += f"### {m['role'].capitalize()}\n{m['content']}\n\n---\n"
-        st.download_button(
-            "📄 Export History (Markdown)",
-            data=md_content,
-            file_name="chat_history.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
-
-
-# =====================================================================
-# Main Chat Area
-# =====================================================================
-st.title("💬 Gemini AI Chat Studio")
-st.caption(
-    f"Active Model: **{model_choice}** | Temperature: `{temperature}` | Sliding Context Window: `{history_limit}` turns"
-)
-
-# Display historical messages
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-# User Chat Input
-user_input = st.chat_input("Type your message here...")
-
-if user_input:
-    # 1. Append & render user message
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    # 2. Sliding window memory slice
-    max_history_entries = history_limit * 2
-    active_history = st.session_state.messages[-max_history_entries:]
-
-    # 3. Stream or Generate Response
-    with st.chat_message("assistant"):
-        response_placeholder = st.empty()
-        full_response = ""
-
-        if is_live_key:
-            try:
-                from google import genai
-                from google.genai import types
-
-                client = genai.Client(api_key=active_api_key)
-
-                config = types.GenerateContentConfig(
-                    system_instruction=system_instruction if system_instruction.strip() else None,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_output_tokens=max_tokens,
+            contents = [
+                types.Content(
+                    role="user" if m.role == "user" else "model",
+                    parts=[types.Part.from_text(text=m.content)],
                 )
-
-                # Format conversation history
-                contents = []
-                for entry in active_history:
-                    contents.append(
-                        types.Content(
-                            role="user" if entry["role"] == "user" else "model",
-                            parts=[types.Part.from_text(text=entry["content"])],
-                        )
-                    )
-
-                # Stream response chunks
-                response_stream = client.models.generate_content_stream(
-                    model=model_choice,
-                    contents=contents,
-                    config=config,
-                )
-
-                for chunk in response_stream:
-                    if chunk.text:
-                        full_response += chunk.text
-                        response_placeholder.markdown(full_response + "▌")
-
-                response_placeholder.markdown(full_response)
-
-                # Telemetry updates
-                p_toks = estimate_tokens(
-                    (system_instruction or "") + " " + " ".join(m["content"] for m in active_history)
-                )
-                c_toks = estimate_tokens(full_response)
-                cost = calculate_cost(model_choice, p_toks, c_toks)
-
-                st.session_state.total_prompt_tokens += p_toks
-                st.session_state.total_completion_tokens += c_toks
-                st.session_state.total_cost_usd += cost
-
-            except Exception as exc:
-                full_response = (
-                    f"**⚠️ API Error Encountered:**\n\n`{str(exc)}`\n\n"
-                    "*Please verify your API key, target model selection, or network connectivity.*"
-                )
-                response_placeholder.markdown(full_response)
-        else:
-            # Interactive simulated response for instant zero-config testing
-            simulated_chunks = [
-                f"**[Simulated Response — {model_choice}]**\n\n",
-                f"I received your query: *\"{user_input}\"*\n\n",
-                f"- **Persona Applied:** `{system_instruction[:50]}...`\n",
-                f"- **Hyperparameters:** Temperature `{temperature}`, Top-P `{top_p}`, Max Tokens `{max_tokens}`\n",
-                f"- **Context Window:** Retaining last `{len(active_history)}` messages in sliding buffer.\n\n",
-                "💡 *To switch to live Gemini generation, add your API key in `.streamlit/secrets.toml`, `.env`, or paste it in the sidebar.*"
+                for m in req.messages
             ]
 
-            for chunk in simulated_chunks:
-                full_response += chunk
-                response_placeholder.markdown(full_response + "▌")
-                time.sleep(0.06)
+            response = client.models.generate_content(
+                model=req.model,
+                contents=contents,
+                config=config,
+            )
 
-            response_placeholder.markdown(full_response)
+            reply_text = response.text or ""
+            c_toks = estimate_tokens(reply_text)
+            cost = calculate_cost(req.model, p_toks, c_toks)
 
-            p_toks = estimate_tokens(user_input)
-            c_toks = estimate_tokens(full_response)
-            cost = calculate_cost(model_choice, p_toks, c_toks)
+            return {
+                "reply": reply_text,
+                "prompt_tokens": p_toks,
+                "completion_tokens": c_toks,
+                "cost_usd": cost,
+                "is_simulated": False,
+            }
 
-            st.session_state.total_prompt_tokens += p_toks
-            st.session_state.total_completion_tokens += c_toks
-            st.session_state.total_cost_usd += cost
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gemini API Error: {str(exc)}",
+            )
 
-    # 4. Save assistant response
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+    # 2. Simulated response fallback if no key is provided
+    last_user_msg = req.messages[-1].content if req.messages else ""
+    c_toks = 85
+    cost = calculate_cost(req.model, p_toks, c_toks)
+
+    simulated_reply = (
+        f"**[Simulation Mode — {req.model}]**\n\n"
+        f"I received your message: *\"{last_user_msg}\"*\n\n"
+        f"- **Active Persona:** `{req.system_instruction[:60] if req.system_instruction else 'Default Assistant'}...`\n"
+        f"- **Parameters:** Temperature `{req.temperature}` | Top-P `{req.top_p}` | Max Tokens `{req.max_output_tokens}`\n\n"
+        f"💡 *To enable live AI generation, supply your Gemini API key in the sidebar settings or set `GEMINI_API_KEY` on Vercel.*"
+    )
+
+    return {
+        "reply": simulated_reply,
+        "prompt_tokens": p_toks,
+        "completion_tokens": c_toks,
+        "cost_usd": cost,
+        "is_simulated": True,
+    }
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_ui():
+    """Serves the complete, standalone AI Chat Studio interface."""
+    return HTMLResponse(content=INDEX_HTML)
+
+
+# Built-in Frontend Application
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gemini AI Chat Studio</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <style>
+    pre code { background: #1e293b !important; border-radius: 0.5rem; padding: 1rem; }
+    .prose p { margin-bottom: 0.75rem; }
+    .prose p:last-child { margin-bottom: 0; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 h-screen flex overflow-hidden font-sans">
+
+  <!-- Sidebar -->
+  <aside class="w-80 bg-slate-900 border-r border-slate-800 flex flex-col justify-between p-4 overflow-y-auto">
+    <div class="space-y-4">
+      <div class="flex items-center gap-2">
+        <span class="text-2xl">✨</span>
+        <h1 class="text-lg font-bold tracking-wide">AI Chat Studio</h1>
+      </div>
+
+      <!-- Authentication -->
+      <div class="space-y-1">
+        <label class="text-xs font-semibold text-slate-400">Gemini API Key</label>
+        <input id="apiKeyInput" type="password" placeholder="Server key active (or paste here)"
+               class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500">
+        <p id="keyStatus" class="text-xs text-emerald-400 mt-1">Checking server key...</p>
+      </div>
+
+      <hr class="border-slate-800">
+
+      <!-- Persona -->
+      <div class="space-y-1">
+        <label class="text-xs font-semibold text-slate-400">Persona Preset</label>
+        <select id="personaPreset" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none">
+          <option value="engineer">Senior Software Engineer</option>
+          <option value="resume">ATS Resume Strategist</option>
+          <option value="tutor">Socratic Tutor</option>
+          <option value="concise">Concise Assistant</option>
+          <option value="custom">Custom Instruction</option>
+        </select>
+        <textarea id="systemPrompt" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded-lg p-2 text-xs focus:outline-none mt-2"></textarea>
+      </div>
+
+      <hr class="border-slate-800">
+
+      <!-- Model Parameters -->
+      <div class="space-y-3">
+        <div>
+          <label class="text-xs font-semibold text-slate-400">Target Model</label>
+          <select id="modelSelect" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none mt-1">
+            <option value="gemini-3.8-flash">gemini-3.8-flash</option>
+            <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
+            <option value="gemini-4-argon">gemini-4-argon</option>
+          </select>
+        </div>
+
+        <div>
+          <div class="flex justify-between text-xs text-slate-400">
+            <span>Temperature</span>
+            <span id="tempVal">0.7</span>
+          </div>
+          <input id="tempSlider" type="range" min="0" max="1.5" step="0.05" value="0.7" class="w-full accent-indigo-500">
+        </div>
+
+        <div>
+          <div class="flex justify-between text-xs text-slate-400">
+            <span>Context Window (Turns)</span>
+            <span id="windowVal">6</span>
+          </div>
+          <input id="windowSlider" type="range" min="1" max="15" step="1" value="6" class="w-full accent-indigo-500">
+        </div>
+      </div>
+
+      <hr class="border-slate-800">
+
+      <!-- Metrics -->
+      <div class="bg-slate-950/60 p-3 rounded-lg border border-slate-800 space-y-1 text-xs">
+        <div class="flex justify-between">
+          <span class="text-slate-400">Prompt Tokens:</span>
+          <span id="promptToks" class="font-mono text-slate-200">0</span>
+        </div>
+        <div class="flex justify-between">
+          <span class="text-slate-400">Output Tokens:</span>
+          <span id="outToks" class="font-mono text-slate-200">0</span>
+        </div>
+        <div class="flex justify-between pt-1 border-t border-slate-800">
+          <span class="text-slate-400">Est. Cost (USD):</span>
+          <span id="costVal" class="font-mono text-emerald-400">$0.000000</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="space-y-2 pt-4">
+      <button onclick="clearChat()" class="w-full bg-slate-800 hover:bg-slate-700 text-xs py-2 rounded-lg font-medium transition">🗑️ Clear Chat</button>
+      <div class="flex gap-2">
+        <button onclick="exportHistory('json')" class="w-1/2 bg-slate-800 hover:bg-slate-700 text-xs py-1.5 rounded-lg transition">Export JSON</button>
+        <button onclick="exportHistory('md')" class="w-1/2 bg-slate-800 hover:bg-slate-700 text-xs py-1.5 rounded-lg transition">Export MD</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main Chat -->
+  <main class="flex-1 flex flex-col h-full bg-slate-950">
+    <!-- Header -->
+    <header class="h-14 border-b border-slate-800 px-6 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <span class="text-lg">🤖</span>
+        <div>
+          <h2 class="text-sm font-semibold text-slate-200" id="headerTitle">Interactive Chat</h2>
+          <p class="text-xs text-slate-400" id="headerSubtitle">Connected to Gemini</p>
+        </div>
+      </div>
+      <div class="text-xs text-slate-400 font-mono bg-slate-900 border border-slate-800 px-3 py-1 rounded-full">
+        Vercel Global Edge
+      </div>
+    </header>
+
+    <!-- Message Stream -->
+    <div id="chatContainer" class="flex-1 overflow-y-auto p-6 space-y-4">
+      <div class="max-w-3xl mx-auto flex gap-3 text-slate-300">
+        <div class="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center font-bold text-xs flex-shrink-0">AI</div>
+        <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl text-sm leading-relaxed prose prose-invert">
+          Hello! How can I assist you today?
+        </div>
+      </div>
+    </div>
+
+    <!-- Input Bar -->
+    <div class="p-4 border-t border-slate-800 bg-slate-900/50">
+      <div class="max-w-3xl mx-auto flex gap-2">
+        <textarea id="userInput" rows="1" placeholder="Type your message... (Enter to send, Shift+Enter for new line)"
+                  class="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-indigo-500 resize-none"></textarea>
+        <button id="sendBtn" onclick="sendMessage()" class="bg-indigo-600 hover:bg-indigo-500 px-5 rounded-xl font-medium text-sm flex items-center justify-center transition disabled:opacity-50">
+          Send
+        </button>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const PERSONAS = {
+      engineer: "You are an experienced senior software engineer and mentor. Provide clean, idiomatic, well-commented code, explain trade-offs, and suggest architecture best practices.",
+      resume: "You are an expert executive recruiter and ATS resume specialist. Review achievements, quantify impact using the STAR/XYZ framework, and optimize keywords.",
+      tutor: "You are a patient, insightful educator. Instead of giving answers immediately, guide the learner through thought-provoking questions, analogies, and conceptual hints.",
+      concise: "You are a direct, helpful, and concise assistant. Answer all questions accurately and succinctly in under 3 sentences unless explicitly asked to elaborate.",
+      custom: "You are an intelligent, empathetic, and knowledgeable AI assistant."
+    };
+
+    let messages = [];
+    let totalPromptToks = 0;
+    let totalOutToks = 0;
+    let totalCostUsd = 0.0;
+
+    // Elements
+    const apiKeyInput = document.getElementById('apiKeyInput');
+    const keyStatus = document.getElementById('keyStatus');
+    const personaPreset = document.getElementById('personaPreset');
+    const systemPrompt = document.getElementById('systemPrompt');
+    const modelSelect = document.getElementById('modelSelect');
+    const tempSlider = document.getElementById('tempSlider');
+    const tempVal = document.getElementById('tempVal');
+    const windowSlider = document.getElementById('windowSlider');
+    const windowVal = document.getElementById('windowVal');
+    const userInput = document.getElementById('userInput');
+    const chatContainer = document.getElementById('chatContainer');
+    const sendBtn = document.getElementById('sendBtn');
+
+    // Init
+    systemPrompt.value = PERSONAS.engineer;
+    tempSlider.oninput = () => tempVal.innerText = tempSlider.value;
+    windowSlider.oninput = () => windowVal.innerText = windowSlider.value;
+    personaPreset.onchange = () => systemPrompt.value = PERSONAS[personaPreset.value];
+
+    // Check config
+    fetch('/api/config')
+      .then(res => res.json())
+      .then(data => {
+        if (data.has_server_key) {
+          keyStatus.innerText = "✅ Server GEMINI_API_KEY detected";
+          keyStatus.className = "text-xs text-emerald-400 mt-1";
+        } else {
+          keyStatus.innerText = "ℹ️ Simulation mode (paste key above for live LLM)";
+          keyStatus.className = "text-xs text-amber-400 mt-1";
+        }
+      });
+
+    // Enter to send
+    userInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    async function sendMessage() {
+      const text = userInput.value.trim();
+      if (!text) return;
+
+      userInput.value = '';
+      sendBtn.disabled = true;
+
+      // Add user message
+      messages.push({ role: "user", content: text });
+      appendMessage("user", text);
+
+      // Loading bubble
+      const loadingId = appendLoading();
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+
+      // Sliding window context
+      const turnLimit = parseInt(windowSlider.value) * 2;
+      const activeHistory = messages.slice(-turnLimit);
+
+      try {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: activeHistory,
+            system_instruction: systemPrompt.value,
+            model: modelSelect.value,
+            temperature: parseFloat(tempSlider.value),
+            api_key: apiKeyInput.value.trim() || undefined
+          })
+        });
+
+        const data = await response.json();
+        removeLoading(loadingId);
+
+        if (!response.ok) {
+          appendMessage("assistant", `⚠️ **Error:** ${data.detail || 'Failed to generate response'}`);
+        } else {
+          messages.push({ role: "assistant", content: data.reply });
+          appendMessage("assistant", data.reply);
+
+          totalPromptToks += data.prompt_tokens || 0;
+          totalOutToks += data.completion_tokens || 0;
+          totalCostUsd += data.cost_usd || 0.0;
+
+          document.getElementById('promptToks').innerText = totalPromptToks;
+          document.getElementById('outToks').innerText = totalOutToks;
+          document.getElementById('costVal').innerText = `$${totalCostUsd.toFixed(6)}`;
+        }
+      } catch (err) {
+        removeLoading(loadingId);
+        appendMessage("assistant", `⚠️ **Connection Error:** ${err.message}`);
+      } finally {
+        sendBtn.disabled = false;
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+      }
+    }
+
+    function appendMessage(role, text) {
+      const isUser = role === "user";
+      const div = document.createElement('div');
+      div.className = "max-w-3xl mx-auto flex gap-3 text-slate-300";
+      div.innerHTML = `
+        <div class="w-8 h-8 rounded-full ${isUser ? 'bg-indigo-500' : 'bg-slate-700'} flex items-center justify-center font-bold text-xs flex-shrink-0">
+          ${isUser ? 'U' : 'AI'}
+        </div>
+        <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl text-sm leading-relaxed prose prose-invert overflow-x-auto flex-1">
+          ${marked.parse(text)}
+        </div>
+      `;
+      chatContainer.appendChild(div);
+      div.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+
+    function appendLoading() {
+      const id = 'loading-' + Date.now();
+      const div = document.createElement('div');
+      div.id = id;
+      div.className = "max-w-3xl mx-auto flex gap-3 text-slate-300";
+      div.innerHTML = `
+        <div class="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center font-bold text-xs flex-shrink-0 animate-pulse">AI</div>
+        <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl text-sm text-slate-400 italic">
+          Thinking...
+        </div>
+      `;
+      chatContainer.appendChild(div);
+      return id;
+    }
+
+    function removeLoading(id) {
+      const el = document.getElementById(id);
+      if (el) el.remove();
+    }
+
+    function clearChat() {
+      messages = [];
+      totalPromptToks = 0;
+      totalOutToks = 0;
+      totalCostUsd = 0.0;
+      document.getElementById('promptToks').innerText = "0";
+      document.getElementById('outToks').innerText = "0";
+      document.getElementById('costVal').innerText = "$0.000000";
+      chatContainer.innerHTML = `
+        <div class="max-w-3xl mx-auto flex gap-3 text-slate-300">
+          <div class="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center font-bold text-xs flex-shrink-0">AI</div>
+          <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl text-sm leading-relaxed prose prose-invert">
+            Chat cleared! How can I assist you now?
+          </div>
+        </div>
+      `;
+    }
+
+    function exportHistory(format) {
+      if (messages.length === 0) return alert("No messages to export!");
+      let content = "";
+      let filename = "";
+      let type = "";
+
+      if (format === 'json') {
+        content = JSON.stringify(messages, null, 2);
+        filename = "chat_history.json";
+        type = "application/json";
+      } else {
+        content = "# Chat Conversation\\n\\n" + messages.map(m => `### ${m.role.toUpperCase()}\\n${m.content}\\n`).join('\\n---\\n');
+        filename = "chat_history.md";
+        type = "text/markdown";
+      }
+
+      const blob = new Blob([content], { type });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  </script>
+</body>
+</html>
+"""
+
+# Allow running directly via: python app.py
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
