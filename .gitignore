@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+.env
+.env.local
+.venv/
+venv/
+env/
+ENV/
+
+# Streamlit Local Configuration & Secrets
+# Note: Keep secrets.toml private when committing to public repositories
+.streamlit/secrets.toml
+
+# Streamlit run cache
+.streamlit/cache/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Exported user files
+exports/
+*.tmp
